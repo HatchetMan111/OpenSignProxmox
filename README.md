@@ -12,23 +12,37 @@ MongoDB + Caddy**, ausgeliefert als Docker-Images (`opensign/opensign:main`,
 > `UNPRIVILEGED=1 pct set <CTID> --features nesting=1,keyctl=1` — Docker geht dann auch,
 > ist aber weniger fehlertolerant.
 
-## Installation (Einzeiler auf dem Proxmox-Host als root)
+## ⚠️ Wichtig: Platzhalter `USER` nicht verwenden
 
-> Nach Upload dieses Repos als `USER/opensign-proxmox`, Datei `install/opensign.sh`:
+Der Aufruf mit `https://raw.githubusercontent.com/USER/opensign-proxmox/...` führt zu
+**keiner Ausgabe** (zwei neue Prompts, nichts passiert) — `wget -q` schluckt den 404-Fehler
+still. Für **dieses Repo** lautet der fertige Einzeiler:
+
+## Installation (copy-paste, als root auf dem Proxmox-Host)
+
+Voraussetzungen: Proxmox VE 8+, Root-Shell (`root@Prox`), Internet/DNS auf dem Host,
+genug Platz auf `local-lvm`/`local`, DHCP (oder statische IP siehe unten).
 
 ```bash
-bash -c "$(wget -qLO - https://raw.githubusercontent.com/USER/opensign-proxmox/main/install/opensign.sh)"
+bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/OpenSignProxmox/main/install/opensign.sh)"
 ```
 
 Mit Trace bei Problemen:
 
 ```bash
-bash -x -c "$(wget -qLO - https://raw.githubusercontent.com/USER/opensign-proxmox/main/install/opensign.sh)"
+bash -x -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/OpenSignProxmox/main/install/opensign.sh)"
 ```
 
 Das Script ist **idempotent** (`set -euo pipefail` + `trap ERR` mit kompletter
 Fehlerkette): Bei vorhandener CTID wird nichts neu erstellt, sondern Docker-Setup,
 Compose-Files, systemd-Unit und Verifikation erneut ausgeführt.
+
+### Schritt für Schritt
+
+1. Per SSH oder Shell auf den Proxmox-Host (nicht in einen Container).
+2. `pveversion` prüfen — muss eine Version ausgeben.
+3. Einzeiler oben einfügen, Enter. Dauer: je nach Leitung/Template 5–15 Min.
+4. Am Ende steht die URL da (siehe „Erwartete Ausgabe").
 
 ### Variablen (oben im Script, per ENV überschreibbar)
 
@@ -45,7 +59,7 @@ Beispiel statische IP:
 
 ```bash
 CTID=210 IP_MODE=192.168.1.50/24 GATEWAY=192.168.1.1 \
-bash -c "$(wget -qLO - https://raw.githubusercontent.com/USER/opensign-proxmox/main/install/opensign.sh)"
+bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/OpenSignProxmox/main/install/opensign.sh)"
 ```
 
 ## Nach der Installation
@@ -82,21 +96,31 @@ Erwartete Ausgabe (Beispiel):
 # Update (neue Images ziehen, MASTER_KEY bleibt erhalten):
 pct exec 200 -- bash -c "cd /opt/opensign && docker compose pull && docker compose up -d"
 
-# Script erneut laufen lassen (repariert/verifiziert alles):
-bash -c "$(wget -qLO - https://raw.githubusercontent.com/USER/opensign-proxmox/main/install/opensign.sh)"
-# Hinweis: CTID-Env setzen, wenn es nicht die nächste freie ID ist: CTID=200 ...
+# Script erneut laufen lassen (repariert/verifiziert alles; CTID setzen falls bekannt):
+CTID=200 bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/OpenSignProxmox/main/install/opensign.sh)"
 
 # Deinstall (Container + Daten unwiderruflich löschen):
 pct stop 200 && pct destroy 200
 ```
 
-## Debugging — immer komplette Kette
+## Troubleshooting
 
-Das Script gibt bei Fehlern **Exit-Code, fehlgeschlagenes Kommando, Zeile +
-Stacktrace (`caller`)** sowie die relevanten Folgebefehle aus — nie nur die letzte
-Zeile. Zusätzlich:
+**Fall 1: Keine Ausgabe — nur zwei neue Prompts (`root@Prox:~#` … `root@Prox:~#`).**
+Ursache fast immer: falsche URL (z.B. noch `USER`-Platzhalter) oder kein Netz/DNS —
+`wget -q` zeigt den Fehler nicht. Diagnose (Fehler werden hier **angezeigt**):
 
 ```bash
+wget -LO - https://raw.githubusercontent.com/HatchetMan111/OpenSignProxmox/main/install/opensign.sh -O /tmp/opensign.sh; echo "exit=$?"
+head -5 /tmp/opensign.sh
+# Alternativ mit Fehlerausgabe:
+curl -fsSL https://raw.githubusercontent.com/HatchetMan111/OpenSignProxmox/main/install/opensign.sh -o /tmp/opensign.sh && bash /tmp/opensign.sh
+```
+
+**Fall 2: Script startet, bricht aber ab.** Es druckt Exit-Code, Kommando, Zeile und
+Stacktrace. Danach:
+
+```bash
+bash -x -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/OpenSignProxmox/main/install/opensign.sh)"
 pct exec 200 -- systemctl status opensign --no-pager
 pct exec 200 -- journalctl -u opensign --no-pager -n 50
 pct exec 200 -- docker ps

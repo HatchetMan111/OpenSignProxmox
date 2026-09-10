@@ -1,0 +1,404 @@
+#!/usr/bin/env bash
+#
+# OpenSign Proxmox LXC Installer — Community-Scripts-Stil (Single-File Host-Script)
+#
+# App:     OpenSign — freie Open-Source DocuSign-Alternative (Dokumente signieren)
+# Stack:   Node.js (Parse-Server Backend :8080) + React Frontend (:3000) + MongoDB + Caddy (:3001)
+# Repo:    https://github.com/OpenSignLabs/OpenSign (Images: opensign/opensign:main, opensign/opensignserver:main)
+# Lizenz:  MIT (dieses Script) — OpenSign selbst: AGPL-3.0
+# Quelle:  https://github.com/OpenSignLabs/OpenSign · https://docs.opensignlabs.com/docs/self-host/docker/run-locally/
+#
+# Einzeiler (nach Upload in DEIN Repo, z.B. USER/opensign-proxmox, Pfad install/opensign.sh):
+#   bash -c "$(wget -qLO - https://raw.githubusercontent.com/USER/opensign-proxmox/main/install/opensign.sh)"
+# Debug-Modus bei Fehlern:
+#   bash -x -c "$(wget -qLO - https://raw.githubusercontent.com/USER/opensign-proxmox/main/install/opensign.sh)"
+#
+# Was das Script tut (idempotent, mehrfach lauffähig):
+#   1. Prüft Proxmox-Host (root, pveversion, pct, pveam)
+#   2. Ermittelt freie CTID (oder nutzt CTID aus ENV), lädt Debian-12 Template bei Bedarf
+#   3. Erstellt LXC (Standard 2 vCPU / 4 GB RAM / 15 GB Disk, onboot=1, nesting für Docker)
+#   4. Installiert Docker + Compose-Plugin im Container (nur wenn fehlend)
+#   5. Legt /opt/opensign/{docker-compose.yml,.env.prod,Caddyfile} an (LAN-HTTP-Modus, USE_LOCAL=true)
+#   6. Legt systemd-Unit opensign.service an (enable + Restart=always, After docker+network-online)
+#   7. Startet Stack (docker compose pull + up -d), verifiziert Service + HTTP, gibt URL aus
+#
+set -euo pipefail
+
+# ============================================================================
+# KONFIGURATION — alles hier oben anpassbar (ENV überschreibt Default)
+# ============================================================================
+APP="${APP:-opensign}"
+CTID="${CTID:-}"                          # leer = nächste freie ID via pvesh
+HOSTNAME="${HOSTNAME:-opensign}"
+CPU="${CPU:-2}"
+RAM="${RAM:-4096}"                        # MiB (OpenSign + Mongo brauchen min. ~2 GB, empfohlen 4 GB)
+DISK="${DISK:-15}"                        # GB (min. 10, empfohlen 15 inkl. Dokumente)
+STORAGE="${STORAGE:-local-lvm}"           # Rootfs-Storage für den Container
+TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-local}"  # Storage für Container-Templates
+TEMPLATE="${TEMPLATE:-debian-12-standard_12.7-1_amd64.tar.zst}"
+BRIDGE="${BRIDGE:-vmbr0}"
+IP_MODE="${IP_MODE:-dhcp}"                # "dhcp" oder statisch "192.168.1.50/24"
+GATEWAY="${GATEWAY:-}"                    # nur bei statischer IP nötig, z.B. 192.168.1.1
+DNS="${DNS:-1.1.1.1}"
+UNPRIVILEGED="${UNPRIVILEGED:-0}"         # 0=privilegiert (empfohlen für Docker), 1=unprivilegiert geht auch mit nesting+keyctl
+FEATURES="${FEATURES:-nesting=1,keyctl=1}"
+ONBOOT="${ONBOOT:-1}"
+
+UI_PORT="${UI_PORT:-3001}"                # Caddy — das ist die Web-UI URL
+CLIENT_PORT="${CLIENT_PORT:-3000}"        # React Frontend (Debug/Direktzugriff)
+SERVER_PORT="${SERVER_PORT:-8080}"        # Parse-API (Debug/Direktzugriff)
+MONGO_PORT="${MONGO_PORT:-27018}"         # Host-Mapping für Mongo (27017 bleibt intern!)
+
+INSTALL_DIR="${INSTALL_DIR:-/opt/opensign}"
+TIMEZONE="${TIMEZONE:-Europe/Berlin}"
+MONGO_IMAGE="${MONGO_IMAGE:-mongo:7.0}"   # gepinnt (upstream nutzt :latest — nicht reproduzierbar)
+CADDY_IMAGE="${CADDY_IMAGE:-caddy:2-alpine}"
+SERVER_IMAGE="${SERVER_IMAGE:-opensign/opensignserver:main}"  # upstream publiziert nur :main/:staging
+CLIENT_IMAGE="${CLIENT_IMAGE:-opensign/opensign:main}"
+# ============================================================================
+
+# Farben / Logging im Community-Scripts-Stil
+if [[ -t 1 ]]; then
+  C_GREEN='\033[32m'; C_YELLOW='\033[33m'; C_RED='\033[31m'; C_BLUE='\033[34m'; C_RESET='\033[0m'
+else
+  C_GREEN=''; C_YELLOW=''; C_RED=''; C_BLUE=''; C_RESET=''
+fi
+log_info() { echo -e "${C_BLUE}[INFO]${C_RESET}  $*"; }
+log_ok()   { echo -e "${C_GREEN}[OK]${C_RESET}    $*"; }
+log_warn() { echo -e "${C_YELLOW}[WARN]${C_RESET}  $*" >&2; }
+log_err()  { echo -e "${C_RED}[ERROR]${C_RESET} $*" >&2; }
+
+# --- Vollständige Fehlerkette (niemals nur die letzte Zeile) ---
+err_trap() {
+  local ec=$?
+  local cmd="${BASH_COMMAND:-unbekannt}"
+  log_err "═════════ FEHLERKETTE ═════════"
+  log_err "Exit-Code   : ${ec}"
+  log_err "Fehlgeschlagen: ${cmd}"
+  log_err "Script      : ${BASH_SOURCE[1]:-main} Zeile ${BASH_LINENO[0]:-?}"
+  log_err "Stacktrace  :"
+  local i=0
+  while caller $i 2>/dev/null; do i=$((i+1)); done >&2
+  log_err "───────────────────────────────"
+  log_err "Relevante Logs (falls vorhanden):"
+  log_err "  Host: pvesh get /nodes/\$(hostname)/tasks --limit 5  |  pct logs <CTID> 2>/dev/null"
+  log_err "  LXC : pct exec <CTID] -- journalctl -u opensign --no-pager -n 50"
+  log_err "        pct exec <CTID> -- docker logs OpenSignServer-container --tail 50"
+  log_err "        pct exec <CTID> -- docker logs OpenSign-container --tail 50"
+  log_err "Retry mit Trace:"
+  log_err "  bash -x -c \"\$(wget -qLO - <EINZEILER-URL>)\""
+  log_err "═══════════════════════════════"
+}
+trap err_trap ERR
+
+die() { log_err "$*"; exit 1; }
+
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Befehl '$1' fehlt. Läuft das Script auf dem Proxmox-Host als root?"; }
+
+pct_exec() { pct exec "$CTID" -- bash -c "$*"; }
+
+get_next_id() {
+  pvesh get /cluster/nextid 2>/dev/null | tr -d '[:space:]"' || echo "200"
+}
+
+container_exists() { pct status "$1" >/dev/null 2>&1; }
+
+container_ip() {
+  # Versucht IP via pct exec zu ermitteln (eth0), Fallback: pct config
+  pct exec "$CTID" -- bash -c "hostname -I 2>/dev/null | awk '{print \$1}'" 2>/dev/null \
+    || pct config "$CTID" | grep -oP '(?<=ip=)[0-9.]+' | head -1 || true
+}
+
+ensure_template() {
+  if pveam list "${TEMPLATE_STORAGE}" 2>/dev/null | grep -q "${TEMPLATE%%_*}"; then
+    log_ok "Template vorhanden (${TEMPLATE_STORAGE})."
+    return 0
+  fi
+  log_info "Aktualisiere Template-Liste (${TEMPLATE_STORAGE}) …"
+  pveam update
+  log_info "Lade Template ${TEMPLATE} … (kann einige Minuten dauern)"
+  # Vollständige Ausgabe behalten — bei Fehler greift err_trap mit Kette
+  pveam download "${TEMPLATE_STORAGE}" "${TEMPLATE}" \
+    || { log_warn "Exaktes Template nicht gefunden, suche debian-12 Fallback …";
+         local fb; fb=$(pveam available --section system 2>/dev/null | grep -oP 'debian-12-standard_[^\s]+\.tar\.zst' | head -1);
+         [[ -n "${fb:-}" ]] || die "Kein debian-12 Template verfügbar. pveam-Ausgabe prüfen.";
+         TEMPLATE="$fb"; log_info "Fallback-Template: $TEMPLATE";
+         pveam download "${TEMPLATE_STORAGE}" "${TEMPLATE}"; }
+  log_ok "Template bereit: $TEMPLATE"
+}
+
+create_container() {
+  local ip_param nameserver=""
+  if [[ "$IP_MODE" == "dhcp" ]]; then ip_param="ip=dhcp";
+  else ip_param="ip=${IP_MODE}"; [[ -n "$GATEWAY" ]] && ip_param="${ip_param},gw=${GATEWAY}"; fi
+  [[ -n "$DNS" ]] && nameserver="--nameserver $DNS"
+
+  log_info "Erstelle LXC ${CTID} (${HOSTNAME}: ${CPU} vCPU / ${RAM} MB / ${DISK} GB, onboot=${ONBOOT}) …"
+  # shellcheck disable=SC2086
+  pct create "$CTID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" \
+    --hostname "$HOSTNAME" \
+    --cores "$CPU" --memory "$RAM" --swap 512 \
+    --rootfs "${STORAGE}:${DISK}" \
+    --ostype debian \
+    --arch amd64 \
+    --unprivileged "$UNPRIVILEGED" \
+    --features "$FEATURES" \
+    --onboot "$ONBOOT" \
+    --start 0 \
+    --net0 "name=eth0,bridge=${BRIDGE},${ip_param}" \
+    $nameserver \
+    --timezone "$TIMEZONE"
+  log_ok "Container ${CTID} erstellt."
+}
+
+start_container() {
+  if [[ "$(pct status "$CTID" 2>/dev/null | awk '{print $2}')" != "running" ]]; then
+    log_info "Starte Container ${CTID} …"
+    pct start "$CTID"
+  fi
+  log_info "Warte auf Netzwerk im Container (max. 90s) …"
+  for i in $(seq 1 45); do
+    local ip; ip="$(container_ip)"
+    if [[ -n "${ip:-}" ]]; then log_ok "Container-IP: $ip"; return 0; fi
+    sleep 2
+  done
+  die "Container ${CTID} hat keine IP bekommen. Prüfe Bridge/DHCP: pct config ${CTID}"
+}
+
+# ============================================================================
+# Setup INNERHALB des Containers (via pct exec, idempotent)
+# ============================================================================
+setup_inside() {
+  log_info "Installiere OpenSign in LXC ${CTID} (idempotent) …"
+  pct exec "$CTID" -- bash -s -- "$UI_PORT" "$CLIENT_PORT" "$SERVER_PORT" "$MONGO_PORT" "$INSTALL_DIR" "$MONGO_IMAGE" "$CADDY_IMAGE" "$SERVER_IMAGE" "$CLIENT_IMAGE" <<'INNER_EOF'
+set -euo pipefail
+UI_PORT="$1"; CLIENT_PORT="$2"; SERVER_PORT="$3"; MONGO_PORT="$4"; INSTALL_DIR="$5"
+MONGO_IMAGE="$6"; CADDY_IMAGE="$7"; SERVER_IMAGE="$8"; CLIENT_IMAGE="$9"
+
+echo "[INFO]  OS-Update + Basis-Pakete …"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates curl wget gnupg openssl iproute2 systemd-sysv 2>&1 | tail -5
+
+echo "[INFO]  Docker prüfen/installieren (idempotent) …"
+if ! command -v docker >/dev/null 2>&1; then
+  curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+  sh /tmp/get-docker.sh 2>&1 | tail -10
+  rm -f /tmp/get-docker.sh
+else
+  echo "[OK]    Docker bereits vorhanden: $(docker --version)"
+fi
+if ! docker compose version >/dev/null 2>&1; then
+  echo "[INFO]  Installiere docker-compose-plugin …"
+  apt-get install -y --no-install-recommends docker-compose-plugin 2>&1 | tail -3
+fi
+systemctl enable --now docker 2>&1 | tail -2 || service docker start || true
+docker --version; docker compose version
+
+LXC_IP="$(hostname -I | awk '{print $1}')"
+[[ -n "${LXC_IP:-}" ]] || { echo "[ERROR] Keine Container-IP gefunden"; ip addr; exit 1; }
+HOST_URL="http://${LXC_IP}:${UI_PORT}"
+echo "[INFO]  HOST_URL=${HOST_URL}"
+mkdir -p "${INSTALL_DIR}"
+
+# MASTER_KEY idempotent: wiederverwenden falls vorhanden, sonst neu
+if [[ -f "${INSTALL_DIR}/.env.prod" ]] && grep -q '^MASTER_KEY=' "${INSTALL_DIR}/.env.prod"; then
+  MASTER_KEY="$(grep '^MASTER_KEY=' "${INSTALL_DIR}/.env.prod" | cut -d= -f2 | tr -d '\r' | head -1)"
+  [[ -n "${MASTER_KEY:-}" ]] || MASTER_KEY="$(openssl rand -hex 6)"
+else
+  MASTER_KEY="$(openssl rand -hex 6)"
+fi
+echo "[INFO]  Schreibe ${INSTALL_DIR}/.env.prod …"
+cat > "${INSTALL_DIR}/.env.prod" <<EOF
+# OpenSign LAN-Installation (generiert vom Proxmox-Installer, idempotent — MASTER_KEY bleibt stabil)
+PUBLIC_URL=${HOST_URL}
+REACT_APP_APPID=opensign
+REACT_APP_SERVERURL=${HOST_URL}/api/app
+GENERATE_SOURCEMAP=false
+appName=open_sign_server
+MASTER_KEY=${MASTER_KEY}
+MONGODB_URI=mongodb://mongo-container:27017/OpenSignDB
+PARSE_MOUNT=/app
+SERVER_URL=${HOST_URL}/api/app
+USE_LOCAL=true
+SMTP_ENABLE=false
+SMTP_HOST=smtp.yourhost.com
+SMTP_PORT=587
+SMTP_USER_EMAIL=mailer@yourdomain.com
+SMTP_PASS=changeme
+MAILGUN_API_KEY=
+MAILGUN_DOMAIN=
+MAILGUN_SENDER=
+DO_SPACE=
+DO_ENDPOINT=
+DO_ACCESS_KEY_ID=
+DO_SECRET_ACCESS_KEY=
+DO_REGION=
+APP_ID=opensign
+EOF
+
+echo "[INFO]  Schreibe ${INSTALL_DIR}/Caddyfile (HTTP, kein TLS für LAN-IP) …"
+cat > "${INSTALL_DIR}/Caddyfile" <<EOF
+# LAN-Modus: reines HTTP auf :${UI_PORT} (kein ACME/TLS — IPs bekommen kein LE-Zertifikat)
+:${UI_PORT} {
+  handle_path /api/* {
+    reverse_proxy server:${SERVER_PORT}
+  }
+  handle {
+    reverse_proxy client:${CLIENT_PORT}
+  }
+}
+EOF
+
+echo "[INFO]  Schreibe ${INSTALL_DIR}/docker-compose.yml …"
+cat > "${INSTALL_DIR}/docker-compose.yml" <<EOF
+# OpenSign LAN-Stack (Proxmox-Installer). Upstream: https://github.com/OpenSignLabs/OpenSign/blob/main/docker-compose.yml
+services:
+  server:
+    image: ${SERVER_IMAGE}
+    container_name: OpenSignServer-container
+    restart: unless-stopped
+    depends_on: [mongo]
+    env_file: .env.prod
+    environment:
+      - NODE_ENV=production
+      - SERVER_URL=${HOST_URL}/api/app
+      - PUBLIC_URL=${HOST_URL}
+    volumes: [opensign-files:/usr/src/app/files]
+    networks: [app-network]
+  mongo:
+    image: ${MONGO_IMAGE}
+    container_name: mongo-container
+    restart: unless-stopped
+    volumes: [data-volume:/data/db]
+    networks: [app-network]
+  client:
+    image: ${CLIENT_IMAGE}
+    container_name: OpenSign-container
+    restart: unless-stopped
+    depends_on: [server]
+    env_file: .env.prod
+    networks: [app-network]
+  caddy:
+    image: ${CADDY_IMAGE}
+    container_name: caddy-container
+    restart: unless-stopped
+    depends_on: [server, client]
+    ports:
+      - "${UI_PORT}:${UI_PORT}"
+      - "${CLIENT_PORT}:${CLIENT_PORT}"
+      - "${SERVER_PORT}:${SERVER_PORT}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [app-network]
+networks:
+  app-network: {driver: bridge}
+volumes:
+  data-volume:
+  caddy_data:
+  caddy_config:
+  opensign-files:
+EOF
+
+echo "[INFO]  Lege systemd-Unit opensign.service an (reboot-sicher) …"
+cat > /etc/systemd/system/opensign.service <<EOF
+[Unit]
+Description=OpenSign Docker Stack (Proxmox LXC Installer)
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose stop
+ExecReload=/usr/bin/docker compose pull
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable opensign.service
+systemctl enable docker.service || true
+
+echo "[INFO]  Starte Stack (pull + up -d) …"
+cd "${INSTALL_DIR}"
+docker compose pull 2>&1 | tail -20
+docker compose up -d 2>&1 | tail -20
+
+echo "[INFO]  Verifikation im Container …"
+systemctl is-active --quiet docker || { echo "[ERROR] docker.service nicht aktiv"; systemctl status docker --no-pager; exit 1; }
+echo "[OK]    docker.service aktiv"
+systemctl is-active --quiet opensign.service || { echo "[ERROR] opensign.service nicht aktiv"; systemctl status opensign --no-pager; journalctl -u opensign --no-pager -n 50; exit 1; }
+echo "[OK]    opensign.service aktiv"
+
+echo "[INFO]  Warte auf Web-UI (max. 180s): ${HOST_URL} …"
+ok=0
+for i in $(seq 1 36); do
+  if curl -fsS -m 5 "http://127.0.0.1:${UI_PORT}/" -o /dev/null 2>&1; then ok=1; break; fi
+  if curl -fsS -m 5 "http://127.0.0.1:${CLIENT_PORT}/" -o /dev/null 2>&1; then echo "[INFO]  (Frontend :${CLIENT_PORT} schon da, Caddy läuft noch hoch …)"; fi
+  sleep 5
+done
+[[ "$ok" == "1" ]] || {
+  echo "[ERROR] Web-UI antwortet nicht auf 127.0.0.1:${UI_PORT}"
+  echo "--- docker ps ---"; docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+  echo "--- caddy logs ---"; docker logs caddy-container --tail 50 2>&1 || true
+  echo "--- server logs ---"; docker logs OpenSignServer-container --tail 50 2>&1 || true
+  echo "--- client logs ---"; docker logs OpenSign-container --tail 50 2>&1 || true
+  exit 1
+}
+echo "[OK]    Web-UI antwortet auf localhost:${UI_PORT}"
+docker ps --format 'table {{.Names}}\t{{.Status}}'
+echo "INNER_DONE HOST_URL=${HOST_URL} LXC_IP=${LXC_IP}"
+INNER_EOF
+  log_ok "Setup im Container abgeschlossen."
+}
+
+verify_from_host() {
+  local ip; ip="$(container_ip)"
+  log_info "Verifikation vom Host aus (CT ${CTID}, IP ${ip:-?}) …"
+  pct_exec "systemctl is-active --quiet opensign.service && echo HOST_OK_opensign_active || (systemctl status opensign --no-pager; exit 1)"
+  pct_exec "systemctl is-active --quiet docker && echo HOST_OK_docker_active || (systemctl status docker --no-pager; exit 1)"
+  # HTTP-Check durch den Container (localhost im LXC)
+  pct_exec "curl -fsS -m 10 http://127.0.0.1:${UI_PORT}/ -o /dev/null && echo HOST_OK_http_${UI_PORT}"
+  log_ok "Alle Checks bestanden."
+  echo ""
+  echo "════════════════════════════════════════════════════"
+  echo "  OpenSign ist bereit!"
+  echo "  Web-UI : http://${ip}:${UI_PORT}"
+  echo "  API    : http://${ip}:${UI_PORT}/api/app  (direkt: http://${ip}:${SERVER_PORT}/app)"
+  echo "  CT-ID  : ${CTID}  (pct enter ${CTID} / pct exec ${CTID} -- docker ps)"
+  echo "  Erster Start: Konto in der Web-UI registrieren (lokal, USE_LOCAL=true)."
+  echo "  SMTP ist deaktiviert — für E-Mail-Versand .env.prod im Container anpassen:"
+  echo "    pct exec ${CTID} -- nano ${INSTALL_DIR}/.env.prod && pct exec ${CTID} -- systemctl restart opensign"
+  echo "════════════════════════════════════════════════════"
+}
+
+main() {
+  [[ "$(id -u)" == "0" ]] || die "Bitte als root auf dem Proxmox-Host ausführen."
+  need_cmd pveversion; need_cmd pct; need_cmd pveam; need_cmd pvesh; need_cmd wget
+  pveversion >/dev/null || die "pveversion fehlgeschlagen — kein Proxmox-Host?"
+
+  if [[ -z "${CTID:-}" ]]; then CTID="$(get_next_id)"; log_info "Keine CTID vorgegeben → nutze nächste freie ID: ${CTID}"; fi
+  [[ "$CTID" =~ ^[0-9]+$ ]] || die "CTID muss numerisch sein (bekommen: '$CTID')."
+
+  if container_exists "$CTID"; then
+    log_warn "Container ${CTID} existiert bereits → idempotentes Update/Re-Run (kein Neu-Erstellen)."
+  else
+    ensure_template
+    create_container
+  fi
+  start_container
+  # onboot sicherstellen (auch bei existierenden CTs)
+  pct set "$CTID" --onboot "$ONBOOT" 2>/dev/null || true
+  setup_inside
+  verify_from_host
+  log_ok "Fertig. Reboot-Test: pct reboot ${CTID} → danach http://$(container_ip):${UI_PORT} erneut öffnen."
+}
+
+main "$@"

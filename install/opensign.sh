@@ -379,7 +379,13 @@ INNER_EOF
 
 verify_from_host() {
   local ip; ip="$(container_ip)"
-  log_info "Verifikation vom Host aus (CT ${CTID}, IP ${ip:-?}) …"
+  log_info "Verifikation vom Host aus (LXC ${HOSTNAME} / CT ${CTID}, IP ${ip:-?}) …"
+  local cur_name; cur_name="$(pct exec "$CTID" -- hostname 2>/dev/null | tr -d '[:space:]' || true)"
+  if [[ -n "${cur_name:-}" && "${cur_name}" != "${HOSTNAME}" ]]; then
+    log_warn "Hostname im Container ist '${cur_name}', erwartet '${HOSTNAME}' (pct-Config gesetzt — nach Reboot aktiv)."
+  else
+    log_ok "LXC-Name: ${HOSTNAME} (CTID ${CTID})."
+  fi
   pct_exec "systemctl is-active --quiet opensign.service && echo HOST_OK_opensign_active || (systemctl status opensign --no-pager; exit 1)"
   pct_exec "systemctl is-active --quiet docker && echo HOST_OK_docker_active || (systemctl status docker --no-pager; exit 1)"
   # HTTP-Check durch den Container (localhost im LXC)
@@ -390,7 +396,7 @@ verify_from_host() {
   echo "  OpenSign ist bereit!"
   echo "  Web-UI : http://${ip}:${UI_PORT}"
   echo "  API    : http://${ip}:${UI_PORT}/api/app  (direkt: http://${ip}:${SERVER_PORT}/app)"
-  echo "  CT-ID  : ${CTID}  (pct enter ${CTID} / pct exec ${CTID} -- docker ps)"
+  echo "  LXC    : ${HOSTNAME}  (CTID ${CTID} — pct enter ${CTID} / pct exec ${CTID} -- docker ps)"
   echo "  Erster Start: Konto in der Web-UI registrieren (lokal, USE_LOCAL=true)."
   echo "  SMTP ist deaktiviert — für E-Mail-Versand .env.prod im Container anpassen:"
   echo "    pct exec ${CTID} -- nano ${INSTALL_DIR}/.env.prod && pct exec ${CTID} -- systemctl restart opensign"
@@ -405,6 +411,18 @@ main() {
   if [[ -z "${CTID:-}" ]]; then CTID="$(get_next_id)"; log_info "Keine CTID vorgegeben → nutze nächste freie ID: ${CTID}"; fi
   [[ "$CTID" =~ ^[0-9]+$ ]] || die "CTID muss numerisch sein (bekommen: '$CTID')."
 
+  # LXC-Name normalisieren + validieren (Proxmox/hostname: klein, max. 63 Zeichen)
+  HOSTNAME="$(echo "${HOSTNAME:-opensign}" | tr '[:upper:]' '[:lower:]')"
+  [[ "$HOSTNAME" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] \
+    || die "HOSTNAME ungültig: '${HOSTNAME}' (erlaubt: Kleinbuchstaben, Ziffern, Bindestrich, max. 63 Zeichen)."
+
+  echo ""
+  echo "── ${APP}-Installer ─────────────────────────────────"
+  echo "  LXC-Name : ${HOSTNAME}  (CTID ${CTID})"
+  echo "  Ressourcen: ${CPU} vCPU / ${RAM} MB RAM / ${DISK} GB Disk (${STORAGE})"
+  echo "  Netzwerk : ${BRIDGE} / ${IP_MODE}  ·  Web-UI-Port: ${UI_PORT}"
+  echo "─────────────────────────────────────────────────────"
+
   if container_exists "$CTID"; then
     log_warn "Container ${CTID} existiert bereits → idempotentes Update/Re-Run (kein Neu-Erstellen)."
   else
@@ -412,8 +430,11 @@ main() {
     create_container
   fi
   start_container
-  # onboot sicherstellen (auch bei existierenden CTs)
+  # onboot + LXC-Name sicherstellen (auch bei existierenden CTs;
+  # hostnamectl für sofortige Wirkung, pct-Config greift spätestens nach Reboot)
   pct set "$CTID" --onboot "$ONBOOT" 2>/dev/null || true
+  pct set "$CTID" --hostname "$HOSTNAME" 2>/dev/null || true
+  pct exec "$CTID" -- bash -c "hostnamectl set-hostname '${HOSTNAME}' 2>/dev/null || hostname '${HOSTNAME}' 2>/dev/null || true"
   setup_inside
   verify_from_host
   log_ok "Fertig. Reboot-Test: pct reboot ${CTID} → danach http://$(container_ip):${UI_PORT} erneut öffnen."

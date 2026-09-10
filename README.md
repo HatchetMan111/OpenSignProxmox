@@ -49,7 +49,8 @@ Compose-Files, systemd-Unit und Verifikation erneut ausgeführt.
 | Variable | Default | Bedeutung |
 |---|---|---|
 | `CTID` | nächste freie ID | `CTID=200 bash -c "$(wget …)"` |
-| `HOSTNAME` | `opensign` | LXC-Name (Proxmox-UI + `hostname` im Container, wird auch bei Re-Run nachgezogen) |
+| `HOSTNAME` | — | **Absichtlich nicht unterstützt:** `$HOSTNAME` setzt die Shell automatisch auf den Proxmox-Hostnamen — der Container hieße sonst wie der Host. Nutze `CT_HOSTNAME`. |
+| `CT_HOSTNAME` | `opensign` | LXC-Name (Proxmox-UI + `hostname` im Container, wird auch bei Re-Run nachgezogen; notfalls rebootet das Script einmal automatisch) |
 | `CPU` / `RAM` / `DISK` | `2` / `4096` / `15` | vCPU / MiB / GB |
 | `STORAGE` / `TEMPLATE_STORAGE` | `local-lvm` / `local` | Rootfs- / Template-Storage |
 | `BRIDGE` / `IP_MODE` / `GATEWAY` | `vmbr0` / `dhcp` | z.B. `IP_MODE=192.168.1.50/24 GATEWAY=192.168.1.1` |

@@ -29,7 +29,10 @@ set -euo pipefail
 # ============================================================================
 APP="${APP:-opensign}"
 CTID="${CTID:-}"                          # leer = nächste freie ID via pvesh
-HOSTNAME="${HOSTNAME:-opensign}"
+# LXC-Name. ABSICHTLICH NICHT "HOSTNAME": $HOSTNAME setzt die Shell automatisch
+# auf den Proxmox-Hostnamen (z.B. "Prox") — ein Default würde nie greifen und jeder
+# Container hieße wie der Host. Daher CT_HOSTNAME (Default: opensign).
+CT_HOSTNAME="${CT_HOSTNAME:-}"
 CPU="${CPU:-2}"
 RAM="${RAM:-4096}"                        # MiB (OpenSign + Mongo brauchen min. ~2 GB, empfohlen 4 GB)
 DISK="${DISK:-15}"                        # GB (min. 10, empfohlen 15 inkl. Dokumente)
@@ -140,10 +143,10 @@ create_container() {
   else ip_param="ip=${IP_MODE}"; [[ -n "$GATEWAY" ]] && ip_param="${ip_param},gw=${GATEWAY}"; fi
   [[ -n "$DNS" ]] && nameserver="--nameserver $DNS"
 
-  log_info "Erstelle LXC ${CTID} (${HOSTNAME}: ${CPU} vCPU / ${RAM} MB / ${DISK} GB, onboot=${ONBOOT}) …"
+  log_info "Erstelle LXC ${CTID} (${CT_HOSTNAME}: ${CPU} vCPU / ${RAM} MB / ${DISK} GB, onboot=${ONBOOT}) …"
   # shellcheck disable=SC2086
   pct create "$CTID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" \
-    --hostname "$HOSTNAME" \
+    --hostname "$CT_HOSTNAME" \
     --cores "$CPU" --memory "$RAM" --swap 512 \
     --rootfs "${STORAGE}:${DISK}" \
     --ostype debian \
@@ -432,12 +435,12 @@ INNER_EOF
 
 verify_from_host() {
   local ip; ip="$(container_ip)"
-  log_info "Verifikation vom Host aus (LXC ${HOSTNAME} / CT ${CTID}, IP ${ip:-?}) …"
+  log_info "Verifikation vom Host aus (LXC ${CT_HOSTNAME} / CT ${CTID}, IP ${ip:-?}) …"
   local cur_name; cur_name="$(pct exec "$CTID" -- hostname 2>/dev/null | tr -d '[:space:]' || true)"
-  if [[ -n "${cur_name:-}" && "${cur_name}" != "${HOSTNAME}" ]]; then
-    log_warn "Hostname im Container ist '${cur_name}', erwartet '${HOSTNAME}' (pct-Config gesetzt — nach Reboot aktiv)."
+  if [[ -n "${cur_name:-}" && "${cur_name}" != "${CT_HOSTNAME}" ]]; then
+    log_warn "Hostname im Container ist '${cur_name}', erwartet '${CT_HOSTNAME}' (wird unten per Reboot erzwungen)."
   else
-    log_ok "LXC-Name: ${HOSTNAME} (CTID ${CTID})."
+    log_ok "LXC-Name: ${CT_HOSTNAME} (CTID ${CTID})."
   fi
   pct_exec "systemctl is-active --quiet opensign.service && echo HOST_OK_opensign_active || (systemctl status opensign --no-pager; exit 1)"
   pct_exec "systemctl is-active --quiet docker && echo HOST_OK_docker_active || (systemctl status docker --no-pager; exit 1)"
@@ -451,7 +454,7 @@ verify_from_host() {
   echo "  OpenSign ist bereit!"
   echo "  Web-UI : http://${ip}:${UI_PORT}"
   echo "  API    : http://${ip}:${UI_PORT}/api/app  (direkt: http://${ip}:${SERVER_PORT}/app)"
-  echo "  LXC    : ${HOSTNAME}  (CTID ${CTID} — pct enter ${CTID} / pct exec ${CTID} -- docker ps)"
+  echo "  LXC    : ${CT_HOSTNAME}  (CTID ${CTID} — pct enter ${CTID} / pct exec ${CTID} -- docker ps)"
   if [[ "${SEED_ADMIN}" == "1" ]]; then
     echo "  Login  : ${ADMIN_EMAIL} / ${ADMIN_PASS}"
     if [[ "${seed_ok}" == "1" ]]; then
@@ -475,10 +478,16 @@ main() {
   if [[ -z "${CTID:-}" ]]; then CTID="$(get_next_id)"; log_info "Keine CTID vorgegeben → nutze nächste freie ID: ${CTID}"; fi
   [[ "$CTID" =~ ^[0-9]+$ ]] || die "CTID muss numerisch sein (bekommen: '$CTID')."
 
+  # LXC-Name auflösen: ein exportiertes HOSTNAME stammt (fast) immer von der Shell
+  # selbst (= Proxmox-Hostname) und ist NICHT als Wunschname gemeint → ignorieren.
+  if [[ -z "${CT_HOSTNAME:-}" ]]; then
+    [[ -n "${HOSTNAME:-}" ]] && log_warn "Umgebungsvariable HOSTNAME ('${HOSTNAME}') wird ignoriert (Shell-reserviert für den Proxmox-Host). LXC-Name per CT_HOSTNAME setzen."
+    CT_HOSTNAME="opensign"
+  fi
   # LXC-Name normalisieren + validieren (Proxmox/hostname: klein, max. 63 Zeichen)
-  HOSTNAME="$(echo "${HOSTNAME:-opensign}" | tr '[:upper:]' '[:lower:]')"
-  [[ "$HOSTNAME" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] \
-    || die "HOSTNAME ungültig: '${HOSTNAME}' (erlaubt: Kleinbuchstaben, Ziffern, Bindestrich, max. 63 Zeichen)."
+  CT_HOSTNAME="$(echo "${CT_HOSTNAME}" | tr '[:upper:]' '[:lower:]')"
+  [[ "$CT_HOSTNAME" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] \
+    || die "CT_HOSTNAME ungültig: '${CT_HOSTNAME}' (erlaubt: Kleinbuchstaben, Ziffern, Bindestrich, max. 63 Zeichen)."
 
   # Admin-Credentials früh validieren (werden als JSON an die Parse-API geschickt)
   if [[ "${SEED_ADMIN:-1}" == "1" ]]; then
@@ -490,7 +499,7 @@ main() {
 
   echo ""
   echo "── ${APP}-Installer ─────────────────────────────────"
-  echo "  LXC-Name : ${HOSTNAME}  (CTID ${CTID})"
+  echo "  LXC-Name : ${CT_HOSTNAME}  (CTID ${CTID})"
   echo "  Ressourcen: ${CPU} vCPU / ${RAM} MB RAM / ${DISK} GB Disk (${STORAGE})"
   echo "  Netzwerk : ${BRIDGE} / ${IP_MODE}  ·  Web-UI-Port: ${UI_PORT}"
   if [[ "${SEED_ADMIN:-1}" == "1" ]]; then echo "  Admin    : ${ADMIN_EMAIL}  (wird angelegt + am Ende ausgegeben)"; fi
@@ -503,14 +512,50 @@ main() {
     create_container
   fi
   start_container
-  # onboot + LXC-Name sicherstellen (auch bei existierenden CTs;
-  # hostnamectl für sofortige Wirkung, pct-Config greift spätestens nach Reboot)
+  # onboot + LXC-Name sicherstellen (auch bei existierenden CTs).
+  # Reihenfolge: erst Config (greift beim Boot), dann live im Container.
+  # hostnamectl braucht D-Bus (im LXC oft abwesend) → "hostname" (Syscall) zuerst,
+  # plus /etc/hostname + /etc/hosts als Gürtel-und-Hosenträger.
   pct set "$CTID" --onboot "$ONBOOT" 2>/dev/null || true
-  pct set "$CTID" --hostname "$HOSTNAME" 2>/dev/null || true
-  pct exec "$CTID" -- bash -c "hostnamectl set-hostname '${HOSTNAME}' 2>/dev/null || hostname '${HOSTNAME}' 2>/dev/null || true"
+  pct set "$CTID" --hostname "$CT_HOSTNAME" 2>/dev/null || true
+  pct config "$CTID" | grep -q "^hostname: ${CT_HOSTNAME}$" \
+    || log_warn "pct-Config meldet anderen Hostnamen — prüfe: pct config ${CTID} | grep hostname"
+  pct exec "$CTID" -- bash -c "echo '${CT_HOSTNAME}' > /etc/hostname; grep -q '^127.0.1.1' /etc/hosts && sed -i 's/^127.0.1.1.*/127.0.1.1\t${CT_HOSTNAME}/' /etc/hosts || echo -e '127.0.1.1\t${CT_HOSTNAME}' >> /etc/hosts; hostname '${CT_HOSTNAME}' 2>/dev/null || hostnamectl set-hostname '${CT_HOSTNAME}' 2>/dev/null || true" 2>/dev/null || true
   setup_inside
   verify_from_host
-  log_ok "Fertig. Reboot-Test: pct reboot ${CTID} → danach http://$(container_ip):${UI_PORT} erneut öffnen."
+  ensure_hostname
+  log_ok "Fertig. Web-UI: http://$(container_ip):${UI_PORT}  (Login: ${ADMIN_EMAIL} / ${ADMIN_PASS})"
+}
+
+# Hostname hart durchsetzen: Falls der live-Hostname (trotz Config + live-Setzen)
+# immer noch abweicht, genau EINMAL rebooten (Config greift beim Boot garantiert)
+# und danach beweisen, dass Services + Web-UI von selbst wiederkommen.
+ensure_hostname() {
+  local live; live="$(pct exec "$CTID" -- hostname 2>/dev/null | tr -d '[:space:]' || true)"
+  if [[ "${live}" == "${CT_HOSTNAME}" ]]; then
+    log_ok "Hostname final: ${live} (kein Reboot nötig)."
+    return 0
+  fi
+  log_warn "Hostname live '${live:-?}' ≠ '${CT_HOSTNAME}' → Reboot (einmalig, Config ist gesetzt) …"
+  pct reboot "$CTID"
+  log_info "Warte auf Reboot (max. 120s) …"
+  local i
+  for i in $(seq 1 60); do
+    if [[ "$(pct status "$CTID" 2>/dev/null | awk '{print $2}')" == "running" ]]; then
+      live="$(pct exec "$CTID" -- hostname 2>/dev/null | tr -d '[:space:]' || true)"
+      if [[ "${live}" == "${CT_HOSTNAME}" && -n "$(container_ip)" ]]; then break; fi
+    fi
+    sleep 2
+  done
+  live="$(pct exec "$CTID" -- hostname 2>/dev/null | tr -d '[:space:]' || true)"
+  [[ "${live}" == "${CT_HOSTNAME}" ]] \
+    || die "Hostname nach Reboot immer noch '${live:-?}'. Prüfe: pct config ${CTID} | grep hostname"
+  log_ok "Hostname nach Reboot: ${live}."
+  pct_exec "systemctl is-active --quiet opensign.service && systemctl is-active --quiet docker" \
+    || die "Services nach Reboot nicht aktiv — prüfe: pct exec ${CTID} -- journalctl -u opensign --no-pager -n 50"
+  pct_exec "curl -fsS -m 10 http://127.0.0.1:${UI_PORT}/ -o /dev/null" \
+    || die "Web-UI nach Reboot nicht erreichbar."
+  log_ok "Reboot-Test bestanden (Hostname + Services + Web-UI)."
 }
 
 main "$@"

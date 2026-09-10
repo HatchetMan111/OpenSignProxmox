@@ -240,12 +240,14 @@ EOF
 echo "[INFO]  Schreibe ${INSTALL_DIR}/Caddyfile (HTTP, kein TLS für LAN-IP) …"
 cat > "${INSTALL_DIR}/Caddyfile" <<EOF
 # LAN-Modus: reines HTTP auf :${UI_PORT} (kein ACME/TLS — IPs bekommen kein LE-Zertifikat)
+# WICHTIG: server/client-Ports sind die FIXEN Container-internen Ports der Images
+# (8080/3000) — nicht die Host-Mappings weiter unten verwechseln.
 :${UI_PORT} {
   handle_path /api/* {
-    reverse_proxy server:${SERVER_PORT}
+    reverse_proxy server:8080
   }
   handle {
-    reverse_proxy client:${CLIENT_PORT}
+    reverse_proxy client:3000
   }
 }
 EOF
@@ -286,8 +288,8 @@ services:
     depends_on: [server, client]
     ports:
       - "${UI_PORT}:${UI_PORT}"
-      - "${CLIENT_PORT}:${CLIENT_PORT}"
-      - "${SERVER_PORT}:${SERVER_PORT}"
+      - "${CLIENT_PORT}:3000"
+      - "${SERVER_PORT}:8080"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
@@ -331,9 +333,25 @@ cd "${INSTALL_DIR}"
 docker compose pull 2>&1 | tail -20
 docker compose up -d 2>&1 | tail -20
 
+# Unit auf "active" bringen: nur "enable" reicht NICHT — ohne "start" bleibt eine
+# oneshot-Unit auf inactive(dead) und die Verifikation schlägt fehl (mit
+# RemainAfterExit=yes meldet is-active nach erfolgreichem start "active"/exited).
+echo "[INFO]  Starte opensign.service …"
+systemctl start opensign.service 2>&1 | tail -5 || {
+  echo "[ERROR] systemctl start opensign.service fehlgeschlagen (Exit $?)"
+  echo "--- systemctl status ---"; systemctl status opensign --no-pager || true
+  echo "--- journal ---"; journalctl -u opensign --no-pager -n 50 || true
+  exit 1
+}
+
 echo "[INFO]  Verifikation im Container …"
 systemctl is-active --quiet docker || { echo "[ERROR] docker.service nicht aktiv"; systemctl status docker --no-pager; exit 1; }
 echo "[OK]    docker.service aktiv"
+if ! systemctl is-active --quiet opensign.service; then
+  echo "[WARN]  opensign.service nicht aktiv — versuche restart …"
+  systemctl restart opensign.service || true
+  sleep 3
+fi
 systemctl is-active --quiet opensign.service || { echo "[ERROR] opensign.service nicht aktiv"; systemctl status opensign --no-pager; journalctl -u opensign --no-pager -n 50; exit 1; }
 echo "[OK]    opensign.service aktiv"
 

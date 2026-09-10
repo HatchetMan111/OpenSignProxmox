@@ -55,6 +55,8 @@ Compose-Files, systemd-Unit und Verifikation erneut ausgeführt.
 | `BRIDGE` / `IP_MODE` / `GATEWAY` | `vmbr0` / `dhcp` | z.B. `IP_MODE=192.168.1.50/24 GATEWAY=192.168.1.1` |
 | `UI_PORT` / `CLIENT_PORT` / `SERVER_PORT` | `3001` / `3000` / `8080` | Caddy-UI / Frontend / API |
 | `UNPRIVILEGED` | `0` | `1` für unprivilegiert (nesting bleibt an) |
+| `ADMIN_EMAIL` / `ADMIN_PASS` / `ADMIN_NAME` | `admin@opensign.local` / `admin` / `Administrator` | Erstzugang (wird angelegt + am Ende ausgegeben; Passwort nach Login ändern, kein `"`/`\` verwenden) |
+| `SEED_ADMIN` | `1` | `0` = keinen Admin anlegen (dann manuell im UI registrieren) |
 
 Beispiel statische IP:
 
@@ -72,15 +74,20 @@ Erwartete Ausgabe (Beispiel):
 [OK]    Container-IP: 192.168.1.100
 [OK]    Docker bereits vorhanden: Docker version 26.x
 [OK]    Web-UI antwortet auf localhost:3001
+[OK]    Admin-User: admin@opensign.local (angelegt + Login-Verifikation OK)
 ════════════════════════════════════════════════════
   OpenSign ist bereit!
   Web-UI : http://192.168.1.100:3001
   API    : http://192.168.1.100:3001/api/app
   CT-ID  : 200
+  Login  : admin@opensign.local / admin
+           (Admin, angelegt + Login-Verifikation OK; bitte nach erstem Login Passwort ändern!)
 ════════════════════════════════════════════════════
 ```
 
-1. Browser öffnen: **`http://<LXC-IP>:3001`** → Konto registrieren (lokal).
+1. Browser öffnen: **`http://<LXC-IP>:3001`** → mit **`admin@opensign.local` / `admin`**
+   anmelden (wird vom Script über die `usersignup`-Funktion angelegt inkl. Admin-Rolle,
+   kein manuelles Registrieren nötig). Danach Passwort ändern.
 2. Reboot-Test: `pct reboot 200` → danach `pct exec 200 -- systemctl is-active opensign`
    und URL erneut öffnen (Container hat `onboot: 1`, Service `Restart` via
    `restart: unless-stopped` + `opensign.service` mit `enable`).
@@ -129,6 +136,16 @@ pct exec 200 -- docker logs caddy-container --tail 50
 pct exec 200 -- docker logs OpenSignServer-container --tail 50
 pct exec 200 -- docker logs OpenSign-container --tail 50
 pct exec 200 -- curl -v http://127.0.0.1:3001/
+```
+
+**Fall 3: Login `admin@opensign.local / admin` wird abgewiesen**, obwohl der Banner ihn
+ausgibt. Ursache: Der User existiert aus einem früheren Lauf mit **anderem Passwort**
+(das Script ändert bestehende Passwörter nicht). Entweder mit dem alten Passwort
+anmelden oder den User löschen + Script erneut laufen lassen (legt ihn neu an):
+
+```bash
+pct exec 200 -- docker exec mongo-container mongosh --quiet OpenSignDB --eval 'db._User.deleteOne({username:"admin@opensign.local"}); db.contracts_Users.deleteOne({Email:"admin@opensign.local"})'
+CTID=200 bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/OpenSignProxmox/main/install/opensign.sh)"
 ```
 
 ## Dateien in diesem Repo

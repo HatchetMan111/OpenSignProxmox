@@ -44,6 +44,13 @@ UNPRIVILEGED="${UNPRIVILEGED:-0}"         # 0=privilegiert (empfohlen für Docke
 FEATURES="${FEATURES:-nesting=1,keyctl=1}"
 ONBOOT="${ONBOOT:-1}"
 
+# Admin-Erstzugang (Login im UI = E-Mail; wird per usersignup-Cloud-Function
+# angelegt inkl. Tenant + contracts_Admin-Rolle und am Ende ausgegeben)
+ADMIN_EMAIL="${ADMIN_EMAIL:-admin@opensign.local}"
+ADMIN_PASS="${ADMIN_PASS:-admin}"                    # nach 1. Login ändern! (kein " oder \ verwenden)
+ADMIN_NAME="${ADMIN_NAME:-Administrator}"
+SEED_ADMIN="${SEED_ADMIN:-1}"                        # 0 = keinen Admin anlegen (nur Hinweis ausgeben)
+
 UI_PORT="${UI_PORT:-3001}"                # Caddy — das ist die Web-UI URL
 CLIENT_PORT="${CLIENT_PORT:-3000}"        # React Frontend (Debug/Direktzugriff)
 SERVER_PORT="${SERVER_PORT:-8080}"        # Parse-API (Debug/Direktzugriff)
@@ -170,10 +177,11 @@ start_container() {
 # ============================================================================
 setup_inside() {
   log_info "Installiere OpenSign in LXC ${CTID} (idempotent) …"
-  pct exec "$CTID" -- bash -s -- "$UI_PORT" "$CLIENT_PORT" "$SERVER_PORT" "$MONGO_PORT" "$INSTALL_DIR" "$MONGO_IMAGE" "$CADDY_IMAGE" "$SERVER_IMAGE" "$CLIENT_IMAGE" <<'INNER_EOF'
+  pct exec "$CTID" -- bash -s -- "$UI_PORT" "$CLIENT_PORT" "$SERVER_PORT" "$MONGO_PORT" "$INSTALL_DIR" "$MONGO_IMAGE" "$CADDY_IMAGE" "$SERVER_IMAGE" "$CLIENT_IMAGE" "$ADMIN_EMAIL" "$ADMIN_PASS" "$ADMIN_NAME" "$SEED_ADMIN" "$TIMEZONE" <<'INNER_EOF'
 set -euo pipefail
 UI_PORT="$1"; CLIENT_PORT="$2"; SERVER_PORT="$3"; MONGO_PORT="$4"; INSTALL_DIR="$5"
 MONGO_IMAGE="$6"; CADDY_IMAGE="$7"; SERVER_IMAGE="$8"; CLIENT_IMAGE="$9"
+ADMIN_EMAIL="${10}"; ADMIN_PASS="${11}"; ADMIN_NAME="${12}"; SEED_ADMIN="${13:-1}"; TZ_INNER="${14:-Europe/Berlin}"
 
 echo "[INFO]  OS-Update + Basis-Pakete …"
 export DEBIAN_FRONTEND=noninteractive
@@ -372,6 +380,51 @@ done
 }
 echo "[OK]    Web-UI antwortet auf localhost:${UI_PORT}"
 docker ps --format 'table {{.Names}}\t{{.Status}}'
+
+# --- Admin-Erstzugang anlegen (idempotent) ---------------------------------
+# Gleicher Weg wie die UI-Registrierung: Cloud-Function "usersignup" (legt
+# _User + partners_Tenant + contracts_Users-Eintrag an). Ein reiner DB-Insert
+# würde einen User ohne Tenant/Rolle erzeugen, der sich NICHT einloggen kann.
+# Danach Login-Verifikation exakt wie das UI (Cloud-Function "loginuser").
+echo "[INFO]  Admin-User anlegen (${ADMIN_EMAIL}) …"
+APPID="$(grep '^APP_ID=' "${INSTALL_DIR}/.env.prod" 2>/dev/null | cut -d= -f2 | tr -d '\r' | head -1)"
+APPID="${APPID:-opensign}"
+API="http://127.0.0.1:${SERVER_PORT}/app"
+LOGIN_OK=0; LOGIN_NOTE="Seed übersprungen (SEED_ADMIN=0)"
+last_seed=""
+if [[ "${SEED_ADMIN}" == "1" ]]; then
+  LOGIN_NOTE="Admin-Anlage fehlgeschlagen — bitte einmalig im UI registrieren"
+  for i in $(seq 1 12); do
+    seed="$(curl -sS -m 15 -X POST "${API}/functions/usersignup" \
+      -H 'Content-Type: application/json' \
+      -H "X-Parse-Application-Id: ${APPID}" \
+      -d "{\"userDetails\":{\"name\":\"${ADMIN_NAME}\",\"email\":\"${ADMIN_EMAIL}\",\"password\":\"${ADMIN_PASS}\",\"phone\":\"\",\"role\":\"contracts_Admin\",\"company\":\"Local\",\"jobTitle\":\"Administrator\",\"timezone\":\"${TZ_INNER}\"}}" 2>&1)" || seed=""
+    last_seed="$seed"
+    if echo "$seed" | grep -q 'sessionToken\|User sign up\|User already exist'; then
+      login="$(curl -sS -m 15 -X POST "${API}/functions/loginuser" \
+        -H 'Content-Type: application/json' \
+        -H "X-Parse-Application-Id: ${APPID}" \
+        -d "{\"email\":\"${ADMIN_EMAIL}\",\"password\":\"${ADMIN_PASS}\"}" 2>&1)" || login=""
+      if echo "$login" | grep -q '"objectId"'; then
+        LOGIN_OK=1; LOGIN_NOTE="angelegt + Login-Verifikation OK"; break
+      else
+        LOGIN_NOTE="User existiert, aber Login mit diesem Passwort schlägt fehl (Passwort wurde früher anders gesetzt?)"
+        echo "[WARN]  ${LOGIN_NOTE}"
+        echo "--- loginuser-Antwort (Debug) ---"; echo "$login" | head -c 500; echo
+        break
+      fi
+    fi
+    sleep 8
+  done
+  if [[ "$LOGIN_OK" == "1" ]]; then
+    echo "[OK]    Admin-User: ${ADMIN_EMAIL} (${LOGIN_NOTE})"
+  else
+    echo "[WARN]  ${LOGIN_NOTE}"
+    echo "--- letzte usersignup-Antwort (Debug) ---"; echo "$last_seed" | head -c 500; echo
+  fi
+fi
+# Status für den Host-Teil (Banner) persistieren — Note ohne Pipe-Zeichen
+echo "${LOGIN_OK}|$(echo "${LOGIN_NOTE}" | tr -d '|')" > "${INSTALL_DIR}/.seed_status"
 echo "INNER_DONE HOST_URL=${HOST_URL} LXC_IP=${LXC_IP}"
 INNER_EOF
   log_ok "Setup im Container abgeschlossen."
@@ -391,13 +444,24 @@ verify_from_host() {
   # HTTP-Check durch den Container (localhost im LXC)
   pct_exec "curl -fsS -m 10 http://127.0.0.1:${UI_PORT}/ -o /dev/null && echo HOST_OK_http_${UI_PORT}"
   log_ok "Alle Checks bestanden."
+  local seed_status; seed_status="$(pct_exec "cat ${INSTALL_DIR}/.seed_status 2>/dev/null" || true)"
+  local seed_ok="${seed_status%%|*}"; local seed_note="${seed_status#*|}"
   echo ""
   echo "════════════════════════════════════════════════════"
   echo "  OpenSign ist bereit!"
   echo "  Web-UI : http://${ip}:${UI_PORT}"
   echo "  API    : http://${ip}:${UI_PORT}/api/app  (direkt: http://${ip}:${SERVER_PORT}/app)"
   echo "  LXC    : ${HOSTNAME}  (CTID ${CTID} — pct enter ${CTID} / pct exec ${CTID} -- docker ps)"
-  echo "  Erster Start: Konto in der Web-UI registrieren (lokal, USE_LOCAL=true)."
+  if [[ "${SEED_ADMIN}" == "1" ]]; then
+    echo "  Login  : ${ADMIN_EMAIL} / ${ADMIN_PASS}"
+    if [[ "${seed_ok}" == "1" ]]; then
+      echo "           (Admin, ${seed_note}; bitte nach erstem Login Passwort ändern!)"
+    else
+      echo "           (ACHTUNG: ${seed_note:-Status unbekannt} → ggf. einmalig im UI registrieren)"
+    fi
+  else
+    echo "  Login  : Seed deaktiviert (SEED_ADMIN=0) → bitte einmalig im UI registrieren."
+  fi
   echo "  SMTP ist deaktiviert — für E-Mail-Versand .env.prod im Container anpassen:"
   echo "    pct exec ${CTID} -- nano ${INSTALL_DIR}/.env.prod && pct exec ${CTID} -- systemctl restart opensign"
   echo "════════════════════════════════════════════════════"
@@ -416,11 +480,20 @@ main() {
   [[ "$HOSTNAME" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] \
     || die "HOSTNAME ungültig: '${HOSTNAME}' (erlaubt: Kleinbuchstaben, Ziffern, Bindestrich, max. 63 Zeichen)."
 
+  # Admin-Credentials früh validieren (werden als JSON an die Parse-API geschickt)
+  if [[ "${SEED_ADMIN:-1}" == "1" ]]; then
+    [[ -n "${ADMIN_EMAIL:-}" && -n "${ADMIN_PASS:-}" ]] || die "ADMIN_EMAIL/ADMIN_PASS dürfen nicht leer sein."
+    case "${ADMIN_EMAIL}${ADMIN_PASS}${ADMIN_NAME:-x}" in
+      *\"*|*\\*) die "ADMIN_EMAIL/ADMIN_PASS/ADMIN_NAME dürfen keine Anführungszeichen oder Backslashes enthalten.";;
+    esac
+  fi
+
   echo ""
   echo "── ${APP}-Installer ─────────────────────────────────"
   echo "  LXC-Name : ${HOSTNAME}  (CTID ${CTID})"
   echo "  Ressourcen: ${CPU} vCPU / ${RAM} MB RAM / ${DISK} GB Disk (${STORAGE})"
   echo "  Netzwerk : ${BRIDGE} / ${IP_MODE}  ·  Web-UI-Port: ${UI_PORT}"
+  if [[ "${SEED_ADMIN:-1}" == "1" ]]; then echo "  Admin    : ${ADMIN_EMAIL}  (wird angelegt + am Ende ausgegeben)"; fi
   echo "─────────────────────────────────────────────────────"
 
   if container_exists "$CTID"; then

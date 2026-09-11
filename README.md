@@ -178,6 +178,15 @@ Meldung ab statt 5 Min zu warten (`SKIP_CPU_CHECK=1` nur als Override auf eigene
 Gefahr — der Stack wird darauf nicht laufen). Echte Lösung: neuerer Host bzw. VM mit
 AVX-Passthrough auf AVX-fähiger Hardware.
 
+**Sonderfall: Läuft dein Proxmox selbst als VM** (verschachtelt)? Dann maskiert ggf.
+nur der vCPU-Typ die Flags — echte Lösung ohne neue Hardware möglich:
+
+```bash
+systemd-detect-virt   # meldet z.B. "kvm" → virtualisiert; "none" → Blech (dann ist die CPU wirklich zu alt)
+# Falls virtualisiert, auf dem darüberliegenden Hypervisor den CPU-Typ auf Host-Passthrough stellen,
+# z.B. bei Proxmox darüber: qm set <VMID> --cpu host (VM danach neu starten), dann erneut grep auf AVX.
+```
+
 **Fall 5: `Temporary failure resolving` / Hänger bei `apt-get update`.**
 Der Container hat eine IP, aber kein DNS (DHCP drückt gern Router-DNS rein, der im
 LXC nicht antwortet). Das Script prüft das vorab (`ensure_container_dns`), setzt

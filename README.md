@@ -21,7 +21,9 @@ still. Für **dieses Repo** lautet der fertige Einzeiler:
 ## Installation (copy-paste, als root auf dem Proxmox-Host)
 
 Voraussetzungen: Proxmox VE 8+, Root-Shell (`root@Prox`), Internet/DNS auf dem Host,
-genug Platz auf `local-lvm`/`local`, DHCP (oder statische IP siehe unten).
+genug Platz auf `local-lvm`/`local`, DHCP (oder statische IP siehe unten),
+**CPU mit AVX-Befehlssatz** (`grep -qw avx /proc/cpuinfo` muss treffen — ohne AVX
+startet MongoDB nicht, siehe Fall 6).
 
 ```bash
 bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/OpenSignProxmox/main/install/opensign.sh)"
@@ -160,6 +162,21 @@ bei Crash-Loop mit Server-Logs ab. Sofort-Diagnose:
 pct exec 200 -- curl -s -m 10 http://127.0.0.1:8080/app/health; echo   # soll {"status":"ok"} liefern
 pct exec 200 -- docker logs OpenSignServer-container --tail 40
 ```
+
+**Fall 6: `mongo-container Restarting (132)` — Anmeldung unmöglich, API kommt nie.**
+Exit 132 = SIGILL: MongoDB 5+ braucht den **AVX**-Befehlssatz, deine CPU (oder die
+durchgereichten Flags) hat ihn nicht. Parse Server 8 braucht MongoDB 6+ — ein älteres
+Mongo ist **keine** Option. Diagnose:
+
+```bash
+grep -o -m1 'avx[^ ]*' /proc/cpuinfo | head -1 || echo "KEIN AVX → Hardware zu alt für OpenSign"
+pct exec 200 -- docker logs mongo-container --tail 20
+```
+
+Das Script prüft AVX jetzt **vor** der Container-Erstellung und bricht mit klarer
+Meldung ab statt 5 Min zu warten (`SKIP_CPU_CHECK=1` nur als Override auf eigene
+Gefahr — der Stack wird darauf nicht laufen). Echte Lösung: neuerer Host bzw. VM mit
+AVX-Passthrough auf AVX-fähiger Hardware.
 
 **Fall 5: `Temporary failure resolving` / Hänger bei `apt-get update`.**
 Der Container hat eine IP, aber kein DNS (DHCP drückt gern Router-DNS rein, der im

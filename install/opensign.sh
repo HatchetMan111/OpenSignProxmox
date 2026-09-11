@@ -61,6 +61,7 @@ MONGO_PORT="${MONGO_PORT:-27018}"         # Host-Mapping für Mongo (27017 bleib
 
 INSTALL_DIR="${INSTALL_DIR:-/opt/opensign}"
 TIMEZONE="${TIMEZONE:-Europe/Berlin}"
+SKIP_CPU_CHECK="${SKIP_CPU_CHECK:-0}"            # 1 = AVX-Prüfung überspringen (nur wenn du weißt, was du tust)
 MONGO_IMAGE="${MONGO_IMAGE:-mongo:7.0}"   # gepinnt (upstream nutzt :latest — nicht reproduzierbar)
 CADDY_IMAGE="${CADDY_IMAGE:-caddy:2-alpine}"
 SERVER_IMAGE="${SERVER_IMAGE:-opensign/opensignserver:main}"  # upstream publiziert nur :main/:staging
@@ -421,7 +422,8 @@ API="http://127.0.0.1:${SERVER_PORT}/app"
 LOGIN_OK=0; LOGIN_NOTE="Seed übersprungen (SEED_ADMIN=0)"
 dump_api_debug() {
   echo "--- docker ps ---"; docker ps
-  echo "--- Server-Restarts ---"; docker inspect -f 'Name={{.Name}} RestartCount={{.RestartCount}} Status={{.State.Status}}' mongo-container OpenSignServer-container OpenSign-container caddy-container 2>/dev/null || true
+  echo "--- Container-Status ---"; docker inspect -f 'Name={{.Name}} RestartCount={{.RestartCount}} Status={{.State.Status}} Exit={{.State.ExitCode}}' mongo-container OpenSignServer-container OpenSign-container caddy-container 2>/dev/null || true
+  echo "--- CPU-Flags (AVX?) ---"; grep -m1 -o 'avx[^ ]*' /proc/cpuinfo 2>/dev/null | sort -u || echo "KEIN AVX in /proc/cpuinfo → MongoDB 5+ kann hier NICHT laufen (Exit 132/SIGILL)"
   echo "--- server logs (tail 60) ---"; docker logs OpenSignServer-container --tail 60 2>&1 || true
   echo "--- mongo logs (tail 20) ---"; docker logs mongo-container --tail 20 2>&1 || true
 }
@@ -434,13 +436,15 @@ if [[ "${SEED_ADMIN}" == "1" ]]; then
     hcode="$(curl -s -o /dev/null -m 10 -w '%{http_code}' "${API}/health" 2>/dev/null)"
     hcode="${hcode: -3}"; hcode="${hcode:-000}"
     if [[ "${hcode}" == "200" ]]; then api_ok=1; break; fi
-    rc="$(docker inspect -f '{{.RestartCount}}' OpenSignServer-container 2>/dev/null || echo ?)"
-    if [[ "${rc}" =~ ^[0-9]+$ && "${rc}" -ge 3 ]]; then
-      echo "[ERROR] OpenSignServer-Container startet ständig neu (Restarts: ${rc}) — volle Kette:"
-      dump_api_debug
-      exit 1
-    fi
-    if (( i % 6 == 0 )); then echo "[INFO]  … API noch nicht bereit (Versuch ${i}/30, HTTP ${hcode}, Server-Restarts: ${rc:-?})"; fi
+    for _c in mongo-container OpenSignServer-container; do
+      rc="$(docker inspect -f '{{.RestartCount}}' "$_c" 2>/dev/null || echo ?)"
+      if [[ "${rc}" =~ ^[0-9]+$ && "${rc}" -ge 3 ]]; then
+        echo "[ERROR] Container ${_c} startet ständig neu (Restarts: ${rc}) — volle Kette:"
+        dump_api_debug
+        exit 1
+      fi
+    done
+    if (( i % 6 == 0 )); then echo "[INFO]  … API noch nicht bereit (Versuch ${i}/30, HTTP ${hcode})"; fi
     sleep 10
   done
   if [[ "${api_ok}" != "1" ]]; then
@@ -533,6 +537,19 @@ main() {
   [[ "$(id -u)" == "0" ]] || die "Bitte als root auf dem Proxmox-Host ausführen."
   need_cmd pveversion; need_cmd pct; need_cmd pveam; need_cmd pvesh; need_cmd wget
   pveversion >/dev/null || die "pveversion fehlgeschlagen — kein Proxmox-Host?"
+
+  # CPU-Gate (fail fast, VOR Container-Erstellung): MongoDB 5+ braucht den
+  # AVX-Befehlssatz und stirbt ohne ihn mit Exit 132 (SIGILL, Crash-Loop);
+  # Parse Server 8 braucht MongoDB 6+ — ein älteres Mongo ist keine Option.
+  # LXC sieht die Host-CPU 1:1, daher gilt der Host-Check auch für den Container.
+  if [[ "${SKIP_CPU_CHECK}" != "1" ]]; then
+    if ! grep -qw avx /proc/cpuinfo 2>/dev/null; then
+      die "CPU ohne AVX-Befehlssatz (kein 'avx' in /proc/cpuinfo). MongoDB 5+ startet ohne AVX nicht (Exit 132/SIGILL, Endlos-Restarts), Parse Server 8 braucht MongoDB 6+. Auf dieser Hardware kann OpenSign nicht laufen — neuerer Host nötig (oder VM mit AVX-Passthrough auf AVX-Hardware). Override auf eigene Gefahr: SKIP_CPU_CHECK=1."
+    fi
+    log_ok "CPU-Check: AVX vorhanden."
+  else
+    log_warn "SKIP_CPU_CHECK=1 — AVX-Prüfung übersprungen (bei mongo-Restarts mit Exit 132: Hardware zu alt)."
+  fi
 
   if [[ -z "${CTID:-}" ]]; then CTID="$(get_next_id)"; log_info "Keine CTID vorgegeben → nutze nächste freie ID: ${CTID}"; fi
   [[ "$CTID" =~ ^[0-9]+$ ]] || die "CTID muss numerisch sein (bekommen: '$CTID')."

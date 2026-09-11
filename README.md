@@ -161,6 +161,19 @@ pct exec 200 -- curl -s -m 10 http://127.0.0.1:8080/app/health; echo   # soll {"
 pct exec 200 -- docker logs OpenSignServer-container --tail 40
 ```
 
+**Fall 5: `Temporary failure resolving` / Hänger bei `apt-get update`.**
+Der Container hat eine IP, aber kein DNS (DHCP drückt gern Router-DNS rein, der im
+LXC nicht antwortet). Das Script prüft das vorab (`ensure_container_dns`), setzt
+feste Server (`$DNS`, 1.1.1.1, 8.8.8.8) inkl. dhclient-Hook (rebootfest) und bricht
+mit Routing-vs-DNS-Diagnose ab statt zu hängen. Manuell:
+
+```bash
+pct exec 200 -- cat /etc/resolv.conf
+pct exec 200 -- getent hosts deb.debian.org || echo "DNS kaputt"
+pct exec 200 -- ping -c1 -W3 1.1.1.1 || echo "Routing kaputt"
+pve-firewall status; pct config 200 | grep -E "nameserver|net0"
+```
+
 ## Dateien in diesem Repo
 
 - `install/opensign.sh` — Host-Script (erstellt LXC + installiert alles, Variablen oben)

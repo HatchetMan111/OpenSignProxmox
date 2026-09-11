@@ -175,6 +175,30 @@ start_container() {
   die "Container ${CTID} hat keine IP bekommen. Prüfe Bridge/DHCP: pct config ${CTID}"
 }
 
+# DNS-Gate: Ohne funktionierende Namensauflösung hängt/scheitert alles danach
+# (apt, get.docker.com, Registry-Pulls). DHCP überschreibt /etc/resolv.conf gern
+# mit Router-DNS — darum prüfen, bei Bedarf feste Server setzen + per dhclient-Hook
+# persistent machen, sonst mit Routing-vs-DNS-Diagnose abbrechen statt hängen.
+ensure_container_dns() {
+  log_info "Prüfe DNS im Container (deb.debian.org, raw.githubusercontent.com) …"
+  if pct exec "$CTID" -- bash -c "getent hosts deb.debian.org >/dev/null && getent hosts raw.githubusercontent.com >/dev/null"; then
+    log_ok "DNS im Container funktioniert."
+    return 0
+  fi
+  log_warn "DNS-Auflösung schlägt fehl — setze feste DNS-Server (${DNS}, 1.1.1.1, 8.8.8.8) …"
+  pct exec "$CTID" -- bash -c "printf 'nameserver ${DNS}\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n' | awk '!seen[\$0]++' > /etc/resolv.conf && mkdir -p /etc/dhcp/dhclient-enter-hooks.d && printf 'make_resolv_conf() { :; }\n' > /etc/dhcp/dhclient-enter-hooks.d/keep-dns && cat /etc/resolv.conf"
+  sleep 2
+  if pct exec "$CTID" -- bash -c "getent hosts deb.debian.org >/dev/null && getent hosts raw.githubusercontent.com >/dev/null"; then
+    log_ok "DNS repariert (persistent via dhclient-Hook)."
+    return 0
+  fi
+  if pct exec "$CTID" -- bash -c "ping -c1 -W3 1.1.1.1 >/dev/null 2>&1"; then
+    die "DNS im Container tot, Routing OK. Prüfe: Proxmox-Firewall (pve-firewall status + Regeln für Port 53 auf Datacenter/Node/CT), Router-DNS/Kindersicherung, 'pct config ${CTID} | grep -E \"nameserver|net0\"'."
+  else
+    die "Kein Netzwerk im Container (Ping auf 1.1.1.1 scheitert). Prüfe: Bridge (${BRIDGE}), Gateway (statisch: '${GATEWAY:-–}' / DHCP-Lease am Router), Proxmox-Firewall, 'pct exec ${CTID} -- ip route'."
+  fi
+}
+
 # ============================================================================
 # Setup INNERHALB des Containers (via pct exec, idempotent)
 # ============================================================================
@@ -188,8 +212,9 @@ ADMIN_EMAIL="${10}"; ADMIN_PASS="${11}"; ADMIN_NAME="${12}"; SEED_ADMIN="${13:-1
 
 echo "[INFO]  OS-Update + Basis-Pakete …"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl wget gnupg openssl iproute2 systemd-sysv 2>&1 | tail -5
+APT_OPTS="-o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Acquire::Retries=2"
+apt-get $APT_OPTS update
+apt-get $APT_OPTS install -y --no-install-recommends ca-certificates curl wget gnupg openssl iproute2 systemd-sysv 2>&1 | tail -5
 
 echo "[INFO]  Docker prüfen/installieren (idempotent) …"
 if ! command -v docker >/dev/null 2>&1; then
@@ -555,6 +580,7 @@ main() {
   pct config "$CTID" | grep -q "^hostname: ${CT_HOSTNAME}$" \
     || log_warn "pct-Config meldet anderen Hostnamen — prüfe: pct config ${CTID} | grep hostname"
   pct exec "$CTID" -- bash -c "echo '${CT_HOSTNAME}' > /etc/hostname; grep -q '^127.0.1.1' /etc/hosts && sed -i 's/^127.0.1.1.*/127.0.1.1\t${CT_HOSTNAME}/' /etc/hosts || echo -e '127.0.1.1\t${CT_HOSTNAME}' >> /etc/hosts; hostname '${CT_HOSTNAME}' 2>/dev/null || hostnamectl set-hostname '${CT_HOSTNAME}' 2>/dev/null || true" 2>/dev/null || true
+  ensure_container_dns
   setup_inside
   verify_from_host
   ensure_hostname

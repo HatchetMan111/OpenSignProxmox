@@ -75,6 +75,7 @@ Erwartete Ausgabe (Beispiel):
 [OK]    Container-IP: 192.168.1.100
 [OK]    Docker bereits vorhanden: Docker version 26.x
 [OK]    Web-UI antwortet auf localhost:3001
+[OK]    Parse-API bereit.
 [OK]    Admin-User: admin@opensign.local (angelegt + Login-Verifikation OK)
 ════════════════════════════════════════════════════
   OpenSign ist bereit!
@@ -147,6 +148,17 @@ anmelden oder den User löschen + Script erneut laufen lassen (legt ihn neu an):
 ```bash
 pct exec 200 -- docker exec mongo-container mongosh --quiet OpenSignDB --eval 'db._User.deleteOne({username:"admin@opensign.local"}); db.contracts_Users.deleteOne({Email:"admin@opensign.local"})'
 CTID=200 bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/OpenSignProxmox/main/install/opensign.sh)"
+```
+
+**Fall 4: Seed schlägt mit *leerer* usersignup-Antwort fehl** (Debug-Block zeigt nichts).
+Ursache: Der Parse-Server steckte noch im Erststart (DB-Migration) oder in einem
+Crash-Loop — erkennbar an `Up X seconds` + ständig steigender Restart-Zahl in
+`docker ps`. Aktuelle Script-Version wartet bis ~5 Min auf `/app/health` und bricht
+bei Crash-Loop mit Server-Logs ab. Sofort-Diagnose:
+
+```bash
+pct exec 200 -- curl -s -m 10 http://127.0.0.1:8080/app/health; echo   # soll {"status":"ok"} liefern
+pct exec 200 -- docker logs OpenSignServer-container --tail 40
 ```
 
 ## Dateien in diesem Repo

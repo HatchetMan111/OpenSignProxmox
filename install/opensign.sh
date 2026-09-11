@@ -394,20 +394,52 @@ APPID="$(grep '^APP_ID=' "${INSTALL_DIR}/.env.prod" 2>/dev/null | cut -d= -f2 | 
 APPID="${APPID:-opensign}"
 API="http://127.0.0.1:${SERVER_PORT}/app"
 LOGIN_OK=0; LOGIN_NOTE="Seed übersprungen (SEED_ADMIN=0)"
-last_seed=""
+dump_api_debug() {
+  echo "--- docker ps ---"; docker ps
+  echo "--- Server-Restarts ---"; docker inspect -f 'Name={{.Name}} RestartCount={{.RestartCount}} Status={{.State.Status}}' mongo-container OpenSignServer-container OpenSign-container caddy-container 2>/dev/null || true
+  echo "--- server logs (tail 60) ---"; docker logs OpenSignServer-container --tail 60 2>&1 || true
+  echo "--- mongo logs (tail 20) ---"; docker logs mongo-container --tail 20 2>&1 || true
+}
 if [[ "${SEED_ADMIN}" == "1" ]]; then
-  LOGIN_NOTE="Admin-Anlage fehlgeschlagen — bitte einmalig im UI registrieren"
+  # Phase 1: Auf die Parse-API warten — der Erststart enthält die DB-Migration und
+  # dauert (je nach Disk) mehrere Minuten. Ohne Gate läuft der Seed ins Leere.
+  echo "[INFO]  Warte auf Parse-API (${API}/health, max. ~5 Min: Erststart = Migration) …"
+  api_ok=0; hcode="?"
+  for i in $(seq 1 30); do
+    hcode="$(curl -s -o /dev/null -m 10 -w '%{http_code}' "${API}/health" 2>/dev/null)"
+    hcode="${hcode: -3}"; hcode="${hcode:-000}"
+    if [[ "${hcode}" == "200" ]]; then api_ok=1; break; fi
+    rc="$(docker inspect -f '{{.RestartCount}}' OpenSignServer-container 2>/dev/null || echo ?)"
+    if [[ "${rc}" =~ ^[0-9]+$ && "${rc}" -ge 3 ]]; then
+      echo "[ERROR] OpenSignServer-Container startet ständig neu (Restarts: ${rc}) — volle Kette:"
+      dump_api_debug
+      exit 1
+    fi
+    if (( i % 6 == 0 )); then echo "[INFO]  … API noch nicht bereit (Versuch ${i}/30, HTTP ${hcode}, Server-Restarts: ${rc:-?})"; fi
+    sleep 10
+  done
+  if [[ "${api_ok}" != "1" ]]; then
+    echo "[ERROR] Parse-API antwortet nicht (letzter HTTP-Code: ${hcode}) — volle Kette:"
+    dump_api_debug
+    exit 1
+  fi
+  echo "[OK]    Parse-API bereit."
+  # Phase 2: Seed + Login-Verifikation (mit HTTP-Code statt leerer Rate-Responses)
+  LOGIN_NOTE="Admin-Anlage fehlgeschlagen (Details oben im Log)"
+  last_resp=""; last_code="?"
   for i in $(seq 1 12); do
-    seed="$(curl -sS -m 15 -X POST "${API}/functions/usersignup" \
+    resp="$(curl -s -m 20 -w '\nHTTP:%{http_code}' -X POST "${API}/functions/usersignup" \
       -H 'Content-Type: application/json' \
       -H "X-Parse-Application-Id: ${APPID}" \
-      -d "{\"userDetails\":{\"name\":\"${ADMIN_NAME}\",\"email\":\"${ADMIN_EMAIL}\",\"password\":\"${ADMIN_PASS}\",\"phone\":\"\",\"role\":\"contracts_Admin\",\"company\":\"Local\",\"jobTitle\":\"Administrator\",\"timezone\":\"${TZ_INNER}\"}}" 2>&1)" || seed=""
-    last_seed="$seed"
+      -d "{\"userDetails\":{\"name\":\"${ADMIN_NAME}\",\"email\":\"${ADMIN_EMAIL}\",\"password\":\"${ADMIN_PASS}\",\"phone\":\"\",\"role\":\"contracts_Admin\",\"company\":\"Local\",\"jobTitle\":\"Administrator\",\"timezone\":\"${TZ_INNER}\"}}" 2>&1)"
+    last_code="$(echo "$resp" | grep -o 'HTTP:[0-9]*$' | cut -d: -f2)"; last_code="${last_code:-?}"
+    seed="$(echo "$resp" | sed '$d')"; last_resp="$seed"
     if echo "$seed" | grep -q 'sessionToken\|User sign up\|User already exist'; then
-      login="$(curl -sS -m 15 -X POST "${API}/functions/loginuser" \
+      lresp="$(curl -s -m 20 -w '\nHTTP:%{http_code}' -X POST "${API}/functions/loginuser" \
         -H 'Content-Type: application/json' \
         -H "X-Parse-Application-Id: ${APPID}" \
-        -d "{\"email\":\"${ADMIN_EMAIL}\",\"password\":\"${ADMIN_PASS}\"}" 2>&1)" || login=""
+        -d "{\"email\":\"${ADMIN_EMAIL}\",\"password\":\"${ADMIN_PASS}\"}" 2>&1)"
+      login="$(echo "$lresp" | sed '$d')"
       if echo "$login" | grep -q '"objectId"'; then
         LOGIN_OK=1; LOGIN_NOTE="angelegt + Login-Verifikation OK"; break
       else
@@ -417,13 +449,15 @@ if [[ "${SEED_ADMIN}" == "1" ]]; then
         break
       fi
     fi
+    if (( i % 4 == 0 )); then echo "[INFO]  … Seed-Versuch ${i}/12 (HTTP ${last_code})"; fi
     sleep 8
   done
   if [[ "$LOGIN_OK" == "1" ]]; then
     echo "[OK]    Admin-User: ${ADMIN_EMAIL} (${LOGIN_NOTE})"
   else
-    echo "[WARN]  ${LOGIN_NOTE}"
-    echo "--- letzte usersignup-Antwort (Debug) ---"; echo "$last_seed" | head -c 500; echo
+    echo "[WARN]  ${LOGIN_NOTE} (letzter HTTP-Code: ${last_code})"
+    echo "--- letzte usersignup-Antwort (Debug) ---"; echo "$last_resp" | head -c 500; echo
+    dump_api_debug
   fi
 fi
 # Status für den Host-Teil (Banner) persistieren — Note ohne Pipe-Zeichen
